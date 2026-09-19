@@ -3,16 +3,18 @@ Utility to read a CSV, look up a domain per-row, and write a new CSV with an app
 API-provided date_first_observed column.
 
 Usage (module):
-  from tia_domain_web_api.csv_lookup import process_csv
+  from csv_lookup import process_csv
   process_csv("in.csv", "out.csv", domain_col=2)
 
-Usage (CLI):
-  python -m tia_domain_web_api.csv_lookup input.csv --domain-col 2 --output out.csv
+Usage (CLI, from the directory containing csv_lookup.py and tia_domain_web_api.py):
+  python csv_lookup.py input.csv --domain-col 2 --output out.csv
 """
 # note for the future: use tld extraction to cache and skip loookups that will have the same result
 from typing import Optional
 import csv
 import argparse
+import itertools
+import os
 import time
 from datetime import datetime, date
 from tia_domain_web_api import ThreatIntelligenceAggregatorClient, APIError
@@ -37,11 +39,16 @@ def process_csv(
     """
     if output_path is None:
         # default to input filename with suffix
-        output_path = input_path.rsplit(".", 1)[0] + "_with_lookup.csv"
+        output_path = os.path.splitext(input_path)[0] + "_with_lookup.csv"
+
+    if os.path.abspath(output_path) == os.path.abspath(input_path):
+        # opening the output for writing would truncate the input before it is read
+        raise ValueError("output_path must differ from input_path")
 
     client = ThreatIntelligenceAggregatorClient()
 
-    with open(input_path, newline="", encoding="utf-8") as inf, open(
+    # utf-8-sig strips the BOM Excel adds, which would otherwise corrupt the first cell
+    with open(input_path, newline="", encoding="utf-8-sig") as inf, open(
         output_path, "w", newline="", encoding="utf-8"
     ) as outf:
         reader = csv.reader(inf, delimiter=delimiter)
@@ -61,7 +68,7 @@ def process_csv(
             start_rows = reader  # continue from remainder
         else:
             # no header: treat first_row as data row
-            start_rows = (r for r in ([first_row] + list(reader)))  # include first_row
+            start_rows = itertools.chain([first_row], reader)  # include first_row
 
         # iterate rows
         for row in start_rows:
@@ -73,23 +80,22 @@ def process_csv(
 
             domain = row[domain_col].strip()
             lookup_value = ""
+            called_api = False
             if domain:
                 try:
+                    called_api = True
                     info = client.get_domain_info(domain)
                     # Extract date_first_observed from API result, normalize to YYYY-MM-DD
                     date_val = getattr(info, "date_first_observed", None)
-                    if date_val:
-                        if isinstance(date_val, datetime):
-                            lookup_value = date_val.date().isoformat()
-                        elif isinstance(date_val, date):
-                            lookup_value = date_val.isoformat()
-                        else:
-                            # fallback: string-formatted value
-                            lookup_value = str(date_val)
+                    if isinstance(date_val, datetime):
+                        lookup_value = date_val.date().isoformat()
+                    elif isinstance(date_val, date):
+                        lookup_value = date_val.isoformat()
                     else:
-                        lookup_value = ""  # API returned no date
+                        # API sent a value we could not parse: keep it rather than drop it
+                        lookup_value = getattr(info, "raw_date", None) or ""
                 except APIError:
-                    # API returned a managed error; record blank (or choose "API_ERROR" if preferred)
+                    # includes DomainNotFound (no record); record blank (or choose "API_ERROR" if preferred)
                     lookup_value = ""
                 except Exception:
                     # non-API errors shouldn't stop processing; mark as ERROR to inspect later
@@ -99,7 +105,7 @@ def process_csv(
 
             writer.writerow(row + [lookup_value])
 
-            if sleep_between_calls:
+            if sleep_between_calls and called_api:
                 time.sleep(sleep_between_calls) # number of seconds
 
     return output_path
